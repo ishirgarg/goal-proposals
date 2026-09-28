@@ -3,7 +3,7 @@ import logging
 import pickle
 import random
 import time
-from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Literal, NamedTuple, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
@@ -17,11 +17,12 @@ from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
-from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
+from jaxgcrl.envs.wrappers import GoalCommandWrapper, TrajectoryIdWrapper
+from jaxgcrl.goal_proposers import EnvGoalProposer, GoalProposer, ProposalContext
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
-from .losses import update_actor_and_alpha, update_critic
+from .losses import apply_logit_scale, energy_fn, update_actor_and_alpha, update_critic
 from .networks import Actor, Encoder
 
 Metrics = types.Metrics
@@ -38,6 +39,17 @@ class TrainingState:
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
+
+
+@dataclass
+class GoalState:
+    """Goal-proposal state carried through the training loop next to env_state"""
+
+    proposer_state: Any
+    # actor steps until the next proposal boundary
+    steps_until_proposal: jnp.ndarray
+    # goal metrics summed since the start of the epoch
+    metrics: Dict[str, jnp.ndarray]
 
 
 class Transition(NamedTuple):
@@ -162,6 +174,9 @@ class CRL:
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "bwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
+    # probability that a training (not eval) action is replaced by U[-1, 1]
+    random_action_prob: float = 0.1
+
     def check_config(self, config):
         """
         episode_length: the maximum length of an episode
@@ -181,16 +196,19 @@ class CRL:
             Callable[[base.System, jnp.ndarray], Tuple[base.System, base.System]]
         ] = None,
         progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
+        goal_proposer: GoalProposer = EnvGoalProposer(),
     ):
         self.check_config(config)
 
         unwrapped_env = train_env
         train_env = TrajectoryIdWrapper(train_env)
-        train_env = envs.training.wrap(
+        train_env = envs.training.VmapWrapper(train_env)
+        train_env = envs.training.EpisodeWrapper(
             train_env,
             episode_length=config.episode_length,
             action_repeat=config.action_repeat,
         )
+        train_env = GoalCommandWrapper(train_env, goal_proposer)
 
         eval_env = TrajectoryIdWrapper(eval_env)
         eval_env = envs.training.wrap(
@@ -226,7 +244,9 @@ class CRL:
         random.seed(config.seed)
         np.random.seed(config.seed)
         key = jax.random.PRNGKey(config.seed)
-        key, buffer_key, eval_env_key, env_key, actor_key, sa_key, g_key = jax.random.split(key, 7)
+        key, buffer_key, eval_env_key, env_key, actor_key, sa_key, g_key, proposer_key = jax.random.split(
+            key, 8
+        )
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -334,9 +354,68 @@ class CRL:
                 sample_batch_size=self.batch_size,
                 num_envs=config.num_envs,
                 episode_length=config.episode_length,
+                goal_indices=train_env.goal_indices,
             )
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
+
+        # Goal proposal
+        num_candidates = goal_proposer.total_candidates(config.num_envs)
+        proposal_interval = goal_proposer.proposal_interval_episodes * config.episode_length
+        proposer_state = goal_proposer.init(proposer_key, goal_size)
+        if goal_proposer.proposes:
+            dummy_ctx = ProposalContext(
+                start_obs=jnp.zeros((config.num_envs, obs_size)),
+                env_goals=jnp.zeros((config.num_envs, goal_size)),
+                episodes_ended=jnp.zeros((config.num_envs,)),
+                episodes_reached=jnp.zeros((config.num_envs,)),
+                sample_buffer_goals=lambda key, n: jnp.zeros((n, goal_size)),
+                value_fn=lambda obs, goals: jnp.zeros(goals.shape[:2]),
+            )
+            proposal_metrics_shape = jax.eval_shape(
+                lambda state, key: goal_proposer.propose(
+                    state, jnp.zeros((num_candidates, goal_size)), dummy_ctx, key
+                )[2],
+                proposer_state,
+                proposer_key,
+            )
+        else:
+            proposal_metrics_shape = {}
+
+        def zero_goal_metrics():
+            metrics = {
+                "goals/ended": 0.0,
+                "goals/reached": 0.0,
+                "goals/random_actions": 0.0,
+                "goals/actions": 0.0,
+                "goals/num_proposals": 0.0,
+            }
+            metrics = {k: jnp.zeros((), jnp.float32) for k in metrics}
+            metrics.update({k: jnp.zeros(v.shape, v.dtype) for k, v in proposal_metrics_shape.items()})
+            return metrics
+
+        goal_state = GoalState(
+            proposer_state=proposer_state,
+            steps_until_proposal=jnp.zeros((), jnp.int32),  # propose at the first training step
+            metrics=zero_goal_metrics(),
+        )
+
+        def goal_value(training_state, obs, goals):
+            """Q(s0, g, pi(s0, g)) as the critic energy, for obs [E, obs_dim] and goals [E, N, goal_dim]."""
+            num_envs, num_goals, _ = goals.shape
+            state = jnp.repeat(obs[:, None, :state_size], num_goals, axis=1)
+            state = state.reshape(num_envs * num_goals, state_size)
+            goals = goals.reshape(num_envs * num_goals, goal_size)
+            means, _ = actor.apply(
+                training_state.actor_state.params, jnp.concatenate([state, goals], axis=-1)
+            )
+            action = nn.tanh(means)
+            critic_params = training_state.critic_state.params
+            sa_repr = sa_encoder.apply(critic_params["sa_encoder"], jnp.concatenate([state, action], axis=-1))
+            g_repr = g_encoder.apply(critic_params["g_encoder"], goals)
+            value = energy_fn(self.energy_fn, sa_repr, g_repr)
+            value = apply_logit_scale({"energy_fn": self.energy_fn}, critic_params, value)
+            return value.reshape(num_envs, num_goals)
 
         def deterministic_actor_step(training_state, env, env_state, extra_fields):
             means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
@@ -356,59 +435,130 @@ class CRL:
         def actor_step(actor_state, env, env_state, key, extra_fields):
             means, log_stds = actor.apply(actor_state.params, env_state.obs)
             stds = jnp.exp(log_stds)
-            actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
+            noise_key, random_key, uniform_key = jax.random.split(key, 3)
+            actions = nn.tanh(
+                means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
+            )
+
+            # exploration: with probability eps_i the action is U[-1, 1]; go-explore raises
+            # eps_i with every step spent within the goal threshold this episode
+            eps = jnp.clip(
+                self.random_action_prob
+                + goal_proposer.go_explore_eps_increment * env_state.info["goal_hits"],
+                0.0,
+                1.0,
+            )
+            is_random = jax.random.uniform(random_key, eps.shape) < eps
+            random_actions = jax.random.uniform(uniform_key, actions.shape, minval=-1.0, maxval=1.0)
+            actions = jnp.where(is_random[:, None], random_actions, actions)
 
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
 
-            return nstate, Transition(
-                observation=env_state.obs,
-                action=actions,
-                reward=nstate.reward,
-                discount=1 - nstate.done,
-                extras={"state_extras": state_extras},
+            return (
+                nstate,
+                Transition(
+                    observation=env_state.obs,
+                    action=actions,
+                    reward=nstate.reward,
+                    discount=1 - nstate.done,
+                    extras={"state_extras": state_extras},
+                ),
+                is_random,
             )
 
-        @jax.jit
-        def get_experience(actor_state, env_state, buffer_state, key):
-            @jax.jit
+        @functools.partial(jax.jit, static_argnames=("propose",))
+        def get_experience(training_state, env_state, goal_state, buffer_state, key, propose):
+            def propose_and_reset(env_state, goal_state, key):
+                reset_key, candidate_key, propose_key = jax.random.split(key, 3)
+                # fresh start states (and the env's own goals for them), below the auto-reset wrapper
+                start = train_env.env.reset(jax.random.split(reset_key, config.num_envs))
+                candidates = replay_buffer.sample_goals(buffer_state, candidate_key, num_candidates)
+                ctx = ProposalContext(
+                    start_obs=start.obs,
+                    env_goals=start.obs[:, state_size:],
+                    episodes_ended=env_state.info["episodes_ended"],
+                    episodes_reached=env_state.info["episodes_reached"],
+                    sample_buffer_goals=functools.partial(replay_buffer.sample_goals, buffer_state),
+                    value_fn=functools.partial(goal_value, training_state),
+                )
+                goals, proposer_state, proposal_metrics = goal_proposer.propose(
+                    goal_state.proposer_state, candidates, ctx, propose_key
+                )
+                spec = jax.vmap(unwrapped_env.set_goal)(start, goals)
+                env_state = train_env.command_goals(env_state, spec.pipeline_state, spec.obs, goals)
+
+                metrics = dict(goal_state.metrics)
+                for k, v in proposal_metrics.items():
+                    metrics[k] = metrics[k] + v
+                metrics["goals/num_proposals"] = metrics["goals/num_proposals"] + 1
+                goal_state = goal_state.replace(
+                    proposer_state=proposer_state,
+                    steps_until_proposal=jnp.asarray(proposal_interval, jnp.int32),
+                    metrics=metrics,
+                )
+                return env_state, goal_state
+
             def f(carry, unused_t):
-                env_state, current_key = carry
-                current_key, next_key = jax.random.split(current_key)
-                env_state, transition = actor_step(
-                    actor_state,
+                env_state, goal_state, current_key = carry
+                current_key, next_key, proposal_key = jax.random.split(current_key, 3)
+                if propose:
+                    env_state, goal_state = jax.lax.cond(
+                        goal_state.steps_until_proposal == 0,
+                        propose_and_reset,
+                        lambda env_state, goal_state, key: (env_state, goal_state),
+                        env_state,
+                        goal_state,
+                        proposal_key,
+                    )
+                    goal_state = goal_state.replace(steps_until_proposal=goal_state.steps_until_proposal - 1)
+                env_state, transition, is_random = actor_step(
+                    training_state.actor_state,
                     train_env,
                     env_state,
                     current_key,
                     extra_fields=("truncation", "traj_id"),
                 )
-                return (env_state, next_key), transition
+                metrics = dict(goal_state.metrics)
+                metrics["goals/ended"] += jnp.sum(env_state.info["ended_now"])
+                metrics["goals/reached"] += jnp.sum(env_state.info["ended_reached_now"])
+                metrics["goals/random_actions"] += jnp.sum(is_random)
+                metrics["goals/actions"] += is_random.shape[0]
+                goal_state = goal_state.replace(metrics=metrics)
+                return (env_state, goal_state, next_key), transition
 
-            (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
+            # the buffer is only written after the scan, so proposal candidates come from
+            # the buffer as of the start of the unroll
+            (env_state, goal_state, _), data = jax.lax.scan(
+                f, (env_state, goal_state, key), (), length=self.unroll_length
+            )
 
             buffer_state = replay_buffer.insert(buffer_state, data)
-            return env_state, buffer_state
+            return env_state, goal_state, buffer_state
 
-        def prefill_replay_buffer(training_state, env_state, buffer_state, key):
+        def prefill_replay_buffer(training_state, env_state, goal_state, buffer_state, key):
             @jax.jit
             def f(carry, unused):
                 del unused
-                training_state, env_state, buffer_state, key = carry
+                training_state, env_state, goal_state, buffer_state, key = carry
                 key, new_key = jax.random.split(key)
-                env_state, buffer_state = get_experience(
-                    training_state.actor_state,
+                # prefill never proposes: fresh env starts and goals
+                env_state, goal_state, buffer_state = get_experience(
+                    training_state,
                     env_state,
+                    goal_state,
                     buffer_state,
                     key,
+                    propose=False,
                 )
                 training_state = training_state.replace(
                     env_steps=training_state.env_steps + env_steps_per_actor_step,
                 )
-                return (training_state, env_state, buffer_state, new_key), ()
+                return (training_state, env_state, goal_state, buffer_state, new_key), ()
 
             return jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key),
+                (training_state, env_state, goal_state, buffer_state, key),
                 (),
                 length=num_prefill_actor_steps,
             )[0]
@@ -453,15 +603,19 @@ class CRL:
             ), metrics
 
         @jax.jit
-        def training_step(training_state, env_state, buffer_state, key):
-            experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
+        def training_step(training_state, env_state, goal_state, buffer_state, key):
+            experience_key1, experience_key2, sampling_key, training_key, proposer_key = jax.random.split(
+                key, 5
+            )
 
             # update buffer
-            env_state, buffer_state = get_experience(
-                training_state.actor_state,
+            env_state, goal_state, buffer_state = get_experience(
+                training_state,
                 env_state,
+                goal_state,
                 buffer_state,
                 experience_key1,
+                propose=goal_proposer.proposes,
             )
 
             training_state = training_state.replace(
@@ -499,9 +653,17 @@ class CRL:
                 metrics,
             ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
 
+            # learned proposers train on the same batch (no-op for MEGA)
+            proposer_state, proposer_metrics = goal_proposer.update(
+                goal_state.proposer_state, transitions, proposer_key
+            )
+            goal_state = goal_state.replace(proposer_state=proposer_state)
+            metrics.update(proposer_metrics)
+
             return (
                 training_state,
                 env_state,
+                goal_state,
                 buffer_state,
             ), metrics
 
@@ -509,37 +671,53 @@ class CRL:
         def training_epoch(
             training_state,
             env_state,
+            goal_state,
             buffer_state,
             key,
         ):
             @jax.jit
             def f(carry, unused_t):
-                ts, es, bs, k = carry
+                ts, es, gs, bs, k = carry
                 k, train_key = jax.random.split(k, 2)
                 (
                     (
                         ts,
                         es,
+                        gs,
                         bs,
                     ),
                     metrics,
-                ) = training_step(ts, es, bs, train_key)
-                return (ts, es, bs, k), metrics
+                ) = training_step(ts, es, gs, bs, train_key)
+                return (ts, es, gs, bs, k), metrics
 
-            (training_state, env_state, buffer_state, key), metrics = jax.lax.scan(
+            (training_state, env_state, goal_state, buffer_state, key), metrics = jax.lax.scan(
                 f,
-                (training_state, env_state, buffer_state, key),
+                (training_state, env_state, goal_state, buffer_state, key),
                 (),
                 length=num_training_steps_per_epoch,
             )
 
             metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
-            return training_state, env_state, buffer_state, metrics
+            return training_state, env_state, goal_state, buffer_state, metrics
+
+        def goal_metrics(summed):
+            summed = jax.device_get(summed)
+            metrics = {
+                "goals/episodes_per_env": summed["goals/ended"] / config.num_envs,
+                "goals/random_action_frac": summed["goals/random_actions"] / summed["goals/actions"],
+            }
+            # only episodes that truly ended count (boundary force-resets do not)
+            if summed["goals/ended"] > 0:
+                metrics["goals/intrinsic_success"] = summed["goals/reached"] / summed["goals/ended"]
+            if summed["goals/num_proposals"] > 0:
+                for k in proposal_metrics_shape:
+                    metrics[k] = summed[k] / summed["goals/num_proposals"]
+            return {k: float(v) for k, v in metrics.items()}
 
         key, prefill_key = jax.random.split(key, 2)
 
-        training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-            training_state, env_state, buffer_state, prefill_key
+        training_state, env_state, goal_state, buffer_state, _ = prefill_replay_buffer(
+            training_state, env_state, goal_state, buffer_state, prefill_key
         )
 
         """Setting up evaluator"""
@@ -558,8 +736,9 @@ class CRL:
 
             key, epoch_key = jax.random.split(key)
 
-            training_state, env_state, buffer_state, metrics = training_epoch(
-                training_state, env_state, buffer_state, epoch_key
+            goal_state = goal_state.replace(metrics=zero_goal_metrics())
+            training_state, env_state, goal_state, buffer_state, metrics = training_epoch(
+                training_state, env_state, goal_state, buffer_state, epoch_key
             )
 
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
@@ -574,6 +753,7 @@ class CRL:
                 "training/walltime": training_walltime,
                 "training/envsteps": training_state.env_steps.item(),
                 **{f"training/{name}": value for name, value in metrics.items()},
+                **goal_metrics(goal_state.metrics),
             }
             current_step = int(training_state.env_steps.item())
 

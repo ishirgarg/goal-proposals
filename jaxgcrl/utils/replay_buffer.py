@@ -139,6 +139,7 @@ class TrajectoryUniformSamplingQueue:
         sample_batch_size: int,
         num_envs: int,
         episode_length: int,
+        goal_indices=None,
     ):
         self._flatten_fn = jax.vmap(jax.vmap(lambda x: flatten_util.ravel_pytree(x)[0]))
         dummy_flatten, self._unflatten_fn = flatten_util.ravel_pytree(dummy_data_sample)
@@ -151,6 +152,8 @@ class TrajectoryUniformSamplingQueue:
         self._size = 0
         self.num_envs = num_envs
         self.episode_length = episode_length
+        # indices of the achieved goal within a stored observation (for sample_goals)
+        self.goal_indices = goal_indices
 
     def init(self, key):
         return ReplayBufferState(
@@ -273,6 +276,18 @@ class TrajectoryUniformSamplingQueue:
         batch = create_batch_vmaped(buffer_state.data[:, envs_idxs, :], matrix)
         transitions = self._unflatten_fn(batch)
         return buffer_state.replace(key=key), transitions
+
+    def sample_goals(self, buffer_state, key, n):
+        """Achieved goals obs[goal_indices] of n transitions drawn uniformly over valid
+        (time, env) slots in [sample_position, insert_position). Leaves buffer_state unchanged."""
+        time_key, env_key = jax.random.split(key)
+        time_idxs = jax.random.randint(
+            time_key, (n,), buffer_state.sample_position, buffer_state.insert_position
+        )
+        env_idxs = jax.random.randint(env_key, (n,), 0, self.num_envs)
+        rows = buffer_state.data[time_idxs, env_idxs]
+        observation = self._unflatten_fn(rows[:, None]).observation[:, 0]
+        return observation[:, self.goal_indices]
 
     def size(self, buffer_state: ReplayBufferState) -> int:
         return buffer_state.insert_position - buffer_state.sample_position

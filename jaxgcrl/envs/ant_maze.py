@@ -302,6 +302,13 @@ class AntMaze(PipelineEnv):
         )
         return state.replace(pipeline_state=pipeline_state, obs=obs, reward=reward, done=done)
 
+    def set_goal(self, state: State, goal: jax.Array) -> State:
+        """Command a new goal (torso xy, i.e. obs[goal_indices]) by moving the target there."""
+        q = state.pipeline_state.q.at[-2:].set(goal)
+        pipeline_state = self.pipeline_init(q, state.pipeline_state.qd)
+        obs = self._get_obs(pipeline_state)
+        return state.replace(pipeline_state=pipeline_state, obs=obs)
+
     def _get_obs(self, pipeline_state: base.State) -> jax.Array:
         """Observe ant body position and velocities."""
         qpos = pipeline_state.q[:-2]

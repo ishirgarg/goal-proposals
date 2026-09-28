@@ -7,6 +7,8 @@ import tyro
 from brax.io import model
 
 import wandb
+from jaxgcrl.agents import CRL
+from jaxgcrl.goal_proposers import EnvGoalProposer, MEGAProposer
 from jaxgcrl.utils.config import Config
 from jaxgcrl.utils.env import MetricsRecorder, create_env
 
@@ -44,6 +46,13 @@ def main(config: Config):
     ) / (config.run.num_envs * config.agent.unroll_length)
     info["utd_ratio"] = utd_ratio
     info["agent"] = type(config.agent).__name__
+    info["goal_proposer"] = type(config.goal_proposer).__name__
+    info.update({f"goal_proposer/{k}": v for k, v in vars(config.goal_proposer).items()})
+
+    if not isinstance(config.agent, CRL):
+        assert isinstance(config.goal_proposer, EnvGoalProposer), (
+            f"Goal proposers are only supported for CRL, not {type(config.agent).__name__}"
+        )
 
     logging.info("Arguments:\n%s", pprint.pformat(info))
 
@@ -86,7 +95,18 @@ def main(config: Config):
         "training/critic_loss",
         "training/entropy",
         "training/sps",
+        "goals/intrinsic_success",
+        "goals/episodes_per_env",
+        "goals/random_action_frac",
     ]
+    if isinstance(config.goal_proposer, MEGAProposer):
+        metrics_to_collect += [
+            "mega/cutoff",
+            "mega/frac_candidates_below_cutoff",
+            "mega/selected_log_density",
+            "mega/candidate_log_density",
+            "mega/selected_value",
+        ]
 
     metrics_recorder = MetricsRecorder(
         config.run.total_env_steps,
@@ -96,11 +116,15 @@ def main(config: Config):
         mode=config.run.wandb_mode,
     )
 
+    train_kwargs = {}
+    if isinstance(config.agent, CRL):
+        train_kwargs["goal_proposer"] = config.goal_proposer
     _, params, _ = config.agent.train_fn(
         train_env=env,
         eval_env=eval_env,
         config=config.run,
         progress_fn=metrics_recorder.progress,
+        **train_kwargs,
     )
     model.save_params(ckpt_dir + "/final", params)
 

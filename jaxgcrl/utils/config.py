@@ -1,13 +1,22 @@
 from typing import Literal, Optional, Union
 
+import tyro
 from flax.struct import dataclass
+from typing_extensions import Annotated
 
 from jaxgcrl.agents import CRL, PPO, SAC, TD3
+from jaxgcrl.goal_proposers import EnvGoalProposer, MEGAProposer
 
 from .env import legal_envs
 
 # agent configurations
 AgentConfig = Union[CRL, PPO, SAC, TD3]
+
+# goal proposer configurations (CRL only; other agents require env-goals)
+GoalProposerConfig = Union[
+    Annotated[EnvGoalProposer, tyro.conf.subcommand(name="env-goals")],
+    Annotated[MEGAProposer, tyro.conf.subcommand(name="mega")],
+]
 
 
 @dataclass
@@ -86,3 +95,5 @@ class Config:
     agent: AgentConfig
     # run config
     run: RunConfig
+    # goal proposer; the CLI requires naming it after the agent (`crl env-goals ...` or `crl mega ...`)
+    goal_proposer: GoalProposerConfig = EnvGoalProposer()
