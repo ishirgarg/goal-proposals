@@ -21,7 +21,7 @@
 #   2: MEGA, success range [0, 0.9]
 #   3: MEGA, success range [0.5, 0.9]
 #   4: MEGA, success range [0.75, 0.9]
-# All other settings are the repo defaults (50M env steps, 512 envs, episode_length 1001,
+# 30M env steps per run. All other settings are the repo defaults (512 envs, episode_length 1001,
 # MEGA cutoff starting at initial_cutoff=-6 with ceiling max_cutoff=0).
 
 # Local wandb run data goes to BRC scratch (home quota is small).
@@ -55,6 +55,7 @@ echo "TASK=$SLURM_ARRAY_TASK_ID  ENV=$ENV  SEED=$SEED  CFG_IDX=$CFG_IDX  EXP=$EX
 python run.py crl $PROPOSER_ARGS \
         --env $ENV \
         --seed $SEED \
+        --total_env_steps 30000000 \
         --exp_name $EXP_NAME \
         --wandb_project_name goal-proposals \
         --wandb_group mega_success_range_sweep \
