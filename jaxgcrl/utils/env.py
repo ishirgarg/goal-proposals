@@ -37,6 +37,7 @@ legal_envs = (
     "ant",
     "ant_random_start",
     "ant_ball",
+    "ant_ball_4d",
     "ant_push",
     "humanoid",
     "reacher",
@@ -85,6 +86,9 @@ def create_env(env_name: str, backend: str = None, **kwargs) -> object:
         env = Ant(backend=backend or "spring")
     elif env_name == "ant_random_start":
         env = Ant(backend=backend or "spring", randomize_start=True)
+    elif env_name == "ant_ball_4d":
+        # ant_ball with a 4D goal: [ant xy, ball xy], both must be reached
+        env = AntBall(backend=backend or "spring", ant_goal=True)
     elif env_name == "ant_ball":
         env = AntBall(backend=backend or "spring")
     elif env_name == "ant_push":
