@@ -72,14 +72,23 @@ def _update(proposer, state, q, ended, reached):
 
 
 def test_initial_state():
+    state = MEGAProposer().init(jax.random.PRNGKey(0), 2)
+    assert float(state.cutoff) == -6.0 and float(state.min_cutoff) == -6.0
     state = MEGAProposer(initial_cutoff=-7.0).init(jax.random.PRNGKey(0), 2)
     assert float(state.cutoff) == -7.0 and float(state.min_cutoff) == -7.0
     state = MEGAProposer(initial_cutoff=-7.0, cutoff_floor=-3.0).init(jax.random.PRNGKey(0), 2)
     assert float(state.cutoff) == -3.0 and float(state.min_cutoff) == -3.0
 
 
+def test_initial_cutoff_must_not_exceed_max():
+    with pytest.raises(ValueError, match="max_cutoff"):
+        MEGAProposer(initial_cutoff=1.0, max_cutoff=0.0)
+
+
 def test_cutoff_update_cases():
-    proposer = MEGAProposer(initial_cutoff=-7.0, cutoff_step=1.0, success_lo=0.3, success_hi=0.7)
+    proposer = MEGAProposer(
+        initial_cutoff=-7.0, max_cutoff=-4.5, cutoff_step=1.0, success_lo=0.3, success_hi=0.7
+    )
     state = MEGAState(cutoff=jnp.float32(-7.0), min_cutoff=jnp.float32(-7.0))
 
     # no episode ended: skipped entirely (min_cutoff does not track q either)
@@ -92,12 +101,15 @@ def test_cutoff_update_cases():
     new = _update(proposer, state, [[-7.5]], [1, 0], [1, 0])
     assert float(new.min_cutoff) == -7.5 and float(new.cutoff) == -7.5
 
-    # low success: cutoff rises by a step, capped at initial_cutoff
+    # low success: cutoff rises by a step, above initial_cutoff but capped at max_cutoff
     low = MEGAState(cutoff=jnp.float32(-10.0), min_cutoff=jnp.float32(-20.0))
     new = _update(proposer, low, [[-5.0]], [5, 5], [1, 1])
     assert float(new.cutoff) == -9.0 and float(new.min_cutoff) == -20.0
     new = _update(proposer, state, [[-5.0]], [5, 5], [0, 0])
-    assert float(new.cutoff) == -7.0
+    assert float(new.cutoff) == -6.0
+    near_max = MEGAState(cutoff=jnp.float32(-5.0), min_cutoff=jnp.float32(-20.0))
+    new = _update(proposer, near_max, [[-5.0]], [5, 5], [0, 0])
+    assert float(new.cutoff) == -4.5
 
     # in between: unchanged
     new = _update(proposer, low, [[-5.0]], [2, 2], [1, 1])

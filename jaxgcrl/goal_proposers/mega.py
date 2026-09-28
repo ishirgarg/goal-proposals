@@ -59,7 +59,9 @@ class MEGAProposer(GoalProposer):
         num_candidates: achieved-goal candidates sampled from the buffer per env
         kde_num_samples: buffer goals the KDE is fit on at each proposal
         kde_bandwidth: Gaussian kernel bandwidth (on mean/std-normalized goals)
-        initial_cutoff: starting value, and ceiling, of the value cutoff
+        initial_cutoff: starting value of the value cutoff
+        max_cutoff: ceiling of the value cutoff (the strictest it can get); must be >= initial_cutoff.
+            Unlike the official MEGA code, where initial_cutoff is both start and ceiling.
         cutoff_step: how much the cutoff moves per proposal
         success_lo: intrinsic success rate at or below which the cutoff rises (easier goals)
         success_hi: intrinsic success rate at or above which the cutoff drops (harder goals)
@@ -74,7 +76,8 @@ class MEGAProposer(GoalProposer):
     num_candidates: int = 100
     kde_num_samples: int = 10000
     kde_bandwidth: float = 0.1
-    initial_cutoff: float = -7.0
+    initial_cutoff: float = -6.0
+    max_cutoff: float = 0.0
     cutoff_step: float = 1.0
     success_lo: float = 0.3
     success_hi: float = 0.7
@@ -82,6 +85,12 @@ class MEGAProposer(GoalProposer):
     on_goal_reached: Literal["reset", "go_explore"] = "go_explore"
     go_explore_eps_increment: float = 0.1
     proposal_interval_episodes: int = 1
+
+    def __post_init__(self):
+        if self.initial_cutoff > self.max_cutoff:
+            raise ValueError(
+                f"initial_cutoff ({self.initial_cutoff}) must be <= max_cutoff ({self.max_cutoff})"
+            )
 
     @property
     def _floor(self) -> float:
@@ -111,7 +120,7 @@ class MEGAProposer(GoalProposer):
             )
             cutoff = jnp.where(
                 rate <= self.success_lo,
-                jnp.maximum(jnp.minimum(self.initial_cutoff, cutoff + self.cutoff_step), self._floor),
+                jnp.maximum(jnp.minimum(self.max_cutoff, cutoff + self.cutoff_step), self._floor),
                 cutoff,
             )
             return MEGAState(cutoff=cutoff, min_cutoff=min_cutoff)
