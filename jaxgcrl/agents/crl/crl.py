@@ -148,8 +148,8 @@ class CRL:
     max_replay_size: int = 10000
     min_replay_size: int = 1000
     unroll_length: int = 62
-    h_dim: int = 256
-    n_hidden: int = 2
+    h_dim: int = 512
+    n_hidden: int = 4
     skip_connections: int = 4
     use_relu: bool = False
 
@@ -157,7 +157,7 @@ class CRL:
     repr_dim: int = 64
 
     # layer norm
-    use_ln: bool = False
+    use_ln: bool = True
 
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"

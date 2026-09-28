@@ -49,7 +49,7 @@ class RunConfig:
     eval_env: Optional[Literal[legal_envs]] = None
 
     # number of envs to run in parallel during training
-    num_envs: int = 256
+    num_envs: int = 128
 
     # number of envs to run in parallel during evaluation
     num_eval_envs: int = 256
@@ -57,7 +57,7 @@ class RunConfig:
     action_repeat: int = 1
 
     # total number of evals during training
-    num_evals: int = 200
+    num_evals: int = 50
 
     seed: int = 0
     backend: Optional[Literal["mjx", "spring", "positional", "generalized"]] = None
