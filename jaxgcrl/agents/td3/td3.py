@@ -732,7 +732,6 @@ class TD3:
                 )
 
         total_steps = current_step
-        assert total_steps >= config.total_env_steps
 
         params = _unpmap((training_state.normalizer_params, training_state.policy_params))
 

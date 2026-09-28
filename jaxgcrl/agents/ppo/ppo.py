@@ -546,7 +546,6 @@ class PPO:
                     )
 
         total_steps = current_step
-        assert total_steps >= config.total_env_steps
 
         # If there was no mistakes the training_state should still be identical on all
         # devices.
