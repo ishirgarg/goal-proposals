@@ -604,6 +604,12 @@ class CRL:
 
         total_steps = current_step
 
+        params = (
+            training_state.alpha_state.params,
+            training_state.actor_state.params,
+            training_state.critic_state.params,
+        )
+
         logging.info("total steps: %s", total_steps)
 
         return make_policy, params, metrics
