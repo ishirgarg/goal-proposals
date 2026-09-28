@@ -9,7 +9,11 @@
 #SBATCH --array=0-29
 
 # CRL baseline vs MEGA with different intrinsic-success ranges [success_lo, success_hi]
-# for the adaptive value cutoff. Submit from the repo root.
+# for the adaptive value cutoff. Launch from the repo root, either:
+#   bash scripts/rail_slurm_mega_success_range_sweep_high.sh
+#       splits the 30 tasks across QoS levels: 0-15 high, 16-23 normal, 24-29 low
+#   sbatch scripts/rail_slurm_mega_success_range_sweep_high.sh
+#       submits all 30 tasks on rail_gpu4_high
 #
 # Sweep: 2 envs x 5 configs x 3 seeds = 30 runs.
 #   ENV_IDX  = SLURM_ARRAY_TASK_ID / 15      (0..1)
@@ -23,6 +27,16 @@
 #   4: MEGA, success range [0.75, 0.9]
 # 30M env steps per run. All other settings are the repo defaults (512 envs, episode_length 1001,
 # MEGA cutoff starting at initial_cutoff=-6 with ceiling max_cutoff=0).
+
+# Run with bash (outside a Slurm job): submit this script three times, one QoS per slice of the
+# array. Command-line --qos/--array override the #SBATCH lines above.
+if [ -z "$SLURM_JOB_ID" ]; then
+  set -e
+  sbatch --qos=rail_gpu4_high --array=0-15 "$0"
+  sbatch --qos=rail_gpu4_normal --array=16-23 "$0"
+  sbatch --qos=rail_gpu4_low --array=24-29 "$0"
+  exit 0
+fi
 
 # Local wandb run data goes to BRC scratch (home quota is small).
 export WANDB_DIR=/global/scratch/users/ishirgarg/goal-proposals
