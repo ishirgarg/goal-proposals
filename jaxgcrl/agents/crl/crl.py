@@ -159,7 +159,7 @@ class CRL:
     # layer norm
     use_ln: bool = True
 
-    contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
+    contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "bwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
     def check_config(self, config):
