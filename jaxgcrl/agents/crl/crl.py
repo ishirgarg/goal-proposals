@@ -18,7 +18,7 @@ from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
 from jaxgcrl.envs.wrappers import GoalCommandWrapper, TrajectoryIdWrapper
-from jaxgcrl.goal_proposers import EnvGoalProposer, GoalProposer, ProposalContext
+from jaxgcrl.goal_proposers import EnvGoalProposer, GoalProposer, ProposalContext, UpdateContext
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
@@ -362,7 +362,7 @@ class CRL:
         # Goal proposal
         num_candidates = goal_proposer.total_candidates(config.num_envs)
         proposal_interval = goal_proposer.proposal_interval_episodes * config.episode_length
-        proposer_state = goal_proposer.init(proposer_key, goal_size)
+        proposer_state = goal_proposer.init(proposer_key, goal_size, state_size, action_size)
         if goal_proposer.proposes:
             dummy_ctx = ProposalContext(
                 start_obs=jnp.zeros((config.num_envs, obs_size)),
@@ -371,6 +371,7 @@ class CRL:
                 episodes_reached=jnp.zeros((config.num_envs,)),
                 sample_buffer_goals=lambda key, n: jnp.zeros((n, goal_size)),
                 value_fn=lambda obs, goals: jnp.zeros(goals.shape[:2]),
+                policy_fn=lambda states, goals, key: jnp.zeros(goals.shape[:-1] + (action_size,)),
             )
             proposal_metrics_shape = jax.eval_shape(
                 lambda state, key: goal_proposer.propose(
@@ -432,14 +433,26 @@ class CRL:
                 extras={"state_extras": state_extras},
             )
 
-        def actor_step(actor_state, env, env_state, key, extra_fields):
-            means, log_stds = actor.apply(actor_state.params, env_state.obs)
+        def sample_actions(actor_params, obs, key, random_action_prob):
+            """Training actions for obs [..., obs_dim]: a policy sample, replaced by U[-1, 1]
+            with probability random_action_prob [...]. Returns (actions, is_random)."""
+            means, log_stds = actor.apply(actor_params, obs)
             stds = jnp.exp(log_stds)
             noise_key, random_key, uniform_key = jax.random.split(key, 3)
             actions = nn.tanh(
                 means + stds * jax.random.normal(noise_key, shape=means.shape, dtype=means.dtype)
             )
+            is_random = jax.random.uniform(random_key, random_action_prob.shape) < random_action_prob
+            random_actions = jax.random.uniform(uniform_key, actions.shape, minval=-1.0, maxval=1.0)
+            return jnp.where(is_random[..., None], random_actions, actions), is_random
 
+        def behavior_policy(actor_params, states, goals, key):
+            """Training actions for states [..., state_dim] commanded goals [..., goal_dim], with
+            the base random-action probability (no go-explore boost)."""
+            eps = jnp.full(states.shape[:-1], self.random_action_prob)
+            return sample_actions(actor_params, jnp.concatenate([states, goals], axis=-1), key, eps)[0]
+
+        def actor_step(actor_state, env, env_state, key, extra_fields):
             # exploration: with probability eps_i the action is U[-1, 1]; go-explore raises
             # eps_i with every step spent within the goal threshold this episode
             eps = jnp.clip(
@@ -448,9 +461,7 @@ class CRL:
                 0.0,
                 1.0,
             )
-            is_random = jax.random.uniform(random_key, eps.shape) < eps
-            random_actions = jax.random.uniform(uniform_key, actions.shape, minval=-1.0, maxval=1.0)
-            actions = jnp.where(is_random[:, None], random_actions, actions)
+            actions, is_random = sample_actions(actor_state.params, env_state.obs, key, eps)
 
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
@@ -481,6 +492,7 @@ class CRL:
                     episodes_reached=env_state.info["episodes_reached"],
                     sample_buffer_goals=functools.partial(replay_buffer.sample_goals, buffer_state),
                     value_fn=functools.partial(goal_value, training_state),
+                    policy_fn=functools.partial(behavior_policy, training_state.actor_state.params),
                 )
                 goals, proposer_state, proposal_metrics = goal_proposer.propose(
                     goal_state.proposer_state, candidates, ctx, propose_key
@@ -622,14 +634,14 @@ class CRL:
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
             )
 
-            # sample actor-step worth of transitions
-            buffer_state, transitions = replay_buffer.sample(buffer_state)
+            # sample actor-step worth of trajectory windows
+            buffer_state, trajectories = replay_buffer.sample(buffer_state)
 
             # process transitions for training
-            batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
+            batch_keys = jax.random.split(sampling_key, trajectories.observation.shape[0])
             transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
                 (self.discounting, state_size, tuple(train_env.goal_indices)),
-                transitions,
+                trajectories,
                 batch_keys,
             )
             transitions = jax.tree_util.tree_map(
@@ -653,9 +665,18 @@ class CRL:
                 metrics,
             ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
 
-            # learned proposers train on the same batch (no-op for MEGA)
+            # learned proposers train on the same trajectory windows (no-op for MEGA)
+            update_ctx = UpdateContext(
+                states=trajectories.observation[..., :state_size],
+                actions=trajectories.action,
+                achieved_goals=trajectories.observation[..., train_env.goal_indices],
+                commanded_goals=trajectories.observation[..., state_size:],
+                traj_ids=trajectories.extras["state_extras"]["traj_id"],
+                sample_buffer_goals=functools.partial(replay_buffer.sample_goals, buffer_state),
+                policy_fn=functools.partial(behavior_policy, training_state.actor_state.params),
+            )
             proposer_state, proposer_metrics = goal_proposer.update(
-                goal_state.proposer_state, transitions, proposer_key
+                goal_state.proposer_state, update_ctx, proposer_key
             )
             goal_state = goal_state.replace(proposer_state=proposer_state)
             metrics.update(proposer_metrics)

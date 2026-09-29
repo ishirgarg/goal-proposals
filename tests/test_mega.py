@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from sklearn.neighbors import KernelDensity
 
-from jaxgcrl.goal_proposers import MEGAProposer, MEGAState, ProposalContext
+from jaxgcrl.goal_proposers import MEGAProposer, ProposalContext, ValueCutoff
 from jaxgcrl.goal_proposers.mega import chunked_kde_log_density, kde_log_density
 
 
@@ -16,6 +16,7 @@ def make_ctx(start_obs, ended, reached, value_fn, kde_samples):
         episodes_reached=jnp.asarray(reached, jnp.float32),
         sample_buffer_goals=lambda key, n: kde_samples[:n],
         value_fn=value_fn,
+        policy_fn=None,
     )
 
 
@@ -43,7 +44,7 @@ def test_chunked_kde_matches_unchunked(monkeypatch):
 
 def test_selection_lowest_density_above_cutoff_else_highest_q():
     # 2 envs x 4 candidates on a line; the KDE samples are dense near 0
-    proposer = MEGAProposer(num_candidates=4, kde_num_samples=64, initial_cutoff=-5.0)
+    proposer = MEGAProposer(num_candidates=4, kde_num_samples=64, cutoff=ValueCutoff(initial_cutoff=-5.0))
     candidates = jnp.array(
         [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]
     )
@@ -57,68 +58,19 @@ def test_selection_lowest_density_above_cutoff_else_highest_q():
         ]
     )
     ctx = make_ctx(jnp.zeros((2, 4)), [0, 0], [0, 0], lambda obs, goals: q, kde_samples)
-    state = proposer.init(jax.random.PRNGKey(0), 2)
+    state = proposer.init(jax.random.PRNGKey(0), 2, 4, 2)
     goals, new_state, metrics = proposer.propose(state, candidates, ctx, jax.random.PRNGKey(1))
     np.testing.assert_allclose(goals, [[1.0, 0.0], [3.0, 0.0]])
     # no episode ended -> cutoff untouched
     assert float(new_state.cutoff) == -5.0
-    np.testing.assert_allclose(metrics["mega/selected_value"], (-1.0 + -6.0) / 2)
-    np.testing.assert_allclose(metrics["mega/frac_candidates_below_cutoff"], 5 / 8)
+    np.testing.assert_allclose(metrics["goals/selected_value"], (-1.0 + -6.0) / 2)
+    np.testing.assert_allclose(metrics["goals/frac_candidates_below_cutoff"], 5 / 8)
 
-
-def _update(proposer, state, q, ended, reached):
-    ctx = make_ctx(jnp.zeros((len(ended), 4)), ended, reached, None, None)
-    return proposer.update_cutoff(state, jnp.asarray(q), ctx)
-
-
-def test_initial_state():
-    state = MEGAProposer().init(jax.random.PRNGKey(0), 2)
-    assert float(state.cutoff) == -6.0 and float(state.min_cutoff) == -6.0
-    state = MEGAProposer(initial_cutoff=-7.0).init(jax.random.PRNGKey(0), 2)
-    assert float(state.cutoff) == -7.0 and float(state.min_cutoff) == -7.0
-    state = MEGAProposer(initial_cutoff=-7.0, cutoff_floor=-3.0).init(jax.random.PRNGKey(0), 2)
-    assert float(state.cutoff) == -3.0 and float(state.min_cutoff) == -3.0
-
-
-def test_initial_cutoff_must_not_exceed_max():
-    with pytest.raises(ValueError, match="max_cutoff"):
-        MEGAProposer(initial_cutoff=1.0, max_cutoff=0.0)
-
-
-def test_cutoff_update_cases():
-    proposer = MEGAProposer(
-        initial_cutoff=-7.0, max_cutoff=-4.5, cutoff_step=1.0, success_lo=0.3, success_hi=0.7
-    )
-    state = MEGAState(cutoff=jnp.float32(-7.0), min_cutoff=jnp.float32(-7.0))
-
-    # no episode ended: skipped entirely (min_cutoff does not track q either)
-    new = _update(proposer, state, [[-20.0]], [0, 0], [0, 0])
-    assert float(new.cutoff) == -7.0 and float(new.min_cutoff) == -7.0
-
-    # high success: cutoff drops by a step, but not below min_cutoff = min(q) (no floor)
-    new = _update(proposer, state, [[-20.0]], [2, 2], [2, 1])
-    assert float(new.min_cutoff) == -20.0 and float(new.cutoff) == -8.0
-    new = _update(proposer, state, [[-7.5]], [1, 0], [1, 0])
-    assert float(new.min_cutoff) == -7.5 and float(new.cutoff) == -7.5
-
-    # low success: cutoff rises by a step, above initial_cutoff but capped at max_cutoff
-    low = MEGAState(cutoff=jnp.float32(-10.0), min_cutoff=jnp.float32(-20.0))
-    new = _update(proposer, low, [[-5.0]], [5, 5], [1, 1])
-    assert float(new.cutoff) == -9.0 and float(new.min_cutoff) == -20.0
-    new = _update(proposer, state, [[-5.0]], [5, 5], [0, 0])
-    assert float(new.cutoff) == -6.0
-    near_max = MEGAState(cutoff=jnp.float32(-5.0), min_cutoff=jnp.float32(-20.0))
-    new = _update(proposer, near_max, [[-5.0]], [5, 5], [0, 0])
-    assert float(new.cutoff) == -4.5
-
-    # in between: unchanged
-    new = _update(proposer, low, [[-5.0]], [2, 2], [1, 1])
-    assert float(new.cutoff) == -10.0
-
-    # a floor bounds min_cutoff (and hence the cutoff) from below
-    floored = MEGAProposer(initial_cutoff=-7.0, cutoff_floor=-7.2)
-    new = _update(floored, state, [[-20.0]], [1, 0], [1, 0])
-    assert float(new.min_cutoff) == pytest.approx(-7.2) and float(new.cutoff) == pytest.approx(-7.2)
+    # with the cutoff disabled, MEGA picks each env's lowest-density candidate, 2
+    proposer = MEGAProposer(num_candidates=4, kde_num_samples=64, cutoff=ValueCutoff(initial_cutoff=-np.inf))
+    goals, _, metrics = proposer.propose(proposer.init(None, 2, 4, 2), candidates, ctx, jax.random.PRNGKey(1))
+    np.testing.assert_allclose(goals, [[2.0, 0.0], [2.0, 0.0]])
+    assert "goals/cutoff" not in metrics and "goals/frac_candidates_below_cutoff" not in metrics
 
 
 def test_propose_jits():
@@ -138,7 +90,7 @@ def test_propose_jits():
         return proposer.propose(state, candidates, ctx, key)
 
     candidates = jax.random.normal(jax.random.PRNGKey(1), (num_envs * 5, 2))
-    goals, _, _ = run(proposer.init(None, 2), candidates, jax.random.PRNGKey(2))
+    goals, _, _ = run(proposer.init(None, 2, 4, 2), candidates, jax.random.PRNGKey(2))
     assert goals.shape == (num_envs, 2)
     # every chosen goal is one of that env's own candidates
     per_env = np.asarray(candidates).reshape(num_envs, 5, 2)

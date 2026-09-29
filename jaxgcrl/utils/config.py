@@ -5,7 +5,7 @@ from flax.struct import dataclass
 from typing_extensions import Annotated
 
 from jaxgcrl.agents import CRL, PPO, SAC, TD3
-from jaxgcrl.goal_proposers import EnvGoalProposer, MEGAProposer
+from jaxgcrl.goal_proposers import EnvGoalProposer, MEGAProposer, UCriticProposer
 
 from .env import legal_envs
 
@@ -16,6 +16,7 @@ AgentConfig = Union[CRL, PPO, SAC, TD3]
 GoalProposerConfig = Union[
     Annotated[EnvGoalProposer, tyro.conf.subcommand(name="env-goals")],
     Annotated[MEGAProposer, tyro.conf.subcommand(name="mega")],
+    Annotated[UCriticProposer, tyro.conf.subcommand(name="u-critic")],
 ]
 
 
@@ -95,5 +96,6 @@ class Config:
     agent: AgentConfig
     # run config
     run: RunConfig
-    # goal proposer; the CLI requires naming it after the agent (`crl env-goals ...` or `crl mega ...`)
+    # goal proposer; the CLI requires naming it after the agent
+    # (`crl env-goals ...`, `crl mega ...` or `crl u-critic ...`)
     goal_proposer: GoalProposerConfig = EnvGoalProposer()

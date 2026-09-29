@@ -8,7 +8,12 @@ from brax.io import model
 
 import wandb
 from jaxgcrl.agents import CRL
-from jaxgcrl.goal_proposers import EnvGoalProposer, MEGAProposer
+from jaxgcrl.goal_proposers import (
+    CandidateGoalProposer,
+    EnvGoalProposer,
+    MEGAProposer,
+    UCriticProposer,
+)
 from jaxgcrl.utils.config import Config
 from jaxgcrl.utils.env import MetricsRecorder, create_env
 
@@ -99,13 +104,27 @@ def main(config: Config):
         "goals/episodes_per_env",
         "goals/random_action_frac",
     ]
+    if isinstance(config.goal_proposer, CandidateGoalProposer):
+        metrics_to_collect += ["goals/selected_value"]
+        # missing metrics are recorded as 0, so only collect the cutoff's when it is enabled
+        if config.goal_proposer.cutoff.enabled:
+            metrics_to_collect += ["goals/cutoff", "goals/frac_candidates_below_cutoff"]
     if isinstance(config.goal_proposer, MEGAProposer):
         metrics_to_collect += [
-            "mega/cutoff",
-            "mega/frac_candidates_below_cutoff",
             "mega/selected_log_density",
             "mega/candidate_log_density",
-            "mega/selected_value",
+        ]
+    if isinstance(config.goal_proposer, UCriticProposer):
+        metrics_to_collect += [
+            "ucritic/warm",
+            "ucritic/selected_u",
+            "ucritic/selected_u_std",
+            "ucritic/candidate_u",
+            "ucritic/agrees_with_mega",
+            "training/ucritic/td_loss",
+            "training/ucritic/buffer_entropy",
+            "training/ucritic/novelty_std",
+            "training/ucritic/valid_frac",
         ]
 
     metrics_recorder = MetricsRecorder(

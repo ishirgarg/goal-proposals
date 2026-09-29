@@ -14,6 +14,7 @@ import jax.numpy as jnp
 
 ProposerState = Any
 Metrics = Dict[str, jax.Array]
+PolicyFn = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 
 
 @flax.struct.dataclass
@@ -35,6 +36,29 @@ class ProposalContext:
     sample_buffer_goals: Callable[[jax.Array, int], jax.Array] = flax.struct.field(pytree_node=False)
     # (obs [E, obs_dim], goals [E, N, goal_dim]) -> [E, N]: the agent's value of each goal from each start
     value_fn: Callable[[jax.Array, jax.Array], jax.Array] = flax.struct.field(pytree_node=False)
+    # (states [..., state_dim], goals [..., goal_dim], key) -> [..., action_dim]: training-time actions
+    policy_fn: PolicyFn = flax.struct.field(pytree_node=False)
+
+
+@flax.struct.dataclass
+class UpdateContext:
+    """Everything a learned proposer may train on at each training step: W windows of
+    T consecutive replay-buffer steps (a window may span several episodes)."""
+
+    # [W, T, state_dim]
+    states: jax.Array
+    # [W, T, action_dim] actions actually taken, exploration included
+    actions: jax.Array
+    # [W, T, goal_dim] the goal each state achieves
+    achieved_goals: jax.Array
+    # [W, T, goal_dim] the goal commanded when each state was visited
+    commanded_goals: jax.Array
+    # [W, T] steps with equal ids belong to the same episode
+    traj_ids: jax.Array
+    # (key, n) -> [n, goal_dim]: achieved goals sampled uniformly from the replay buffer
+    sample_buffer_goals: Callable[[jax.Array, int], jax.Array] = flax.struct.field(pytree_node=False)
+    # (states [..., state_dim], goals [..., goal_dim], key) -> [..., action_dim]: training-time actions
+    policy_fn: PolicyFn = flax.struct.field(pytree_node=False)
 
 
 class GoalProposer:
@@ -51,11 +75,13 @@ class GoalProposer:
         """Total number M of buffer goals sampled as candidates per proposal (static)."""
         raise NotImplementedError
 
-    def init(self, key: jax.Array, goal_dim: int) -> ProposerState:
+    def init(self, key: jax.Array, goal_dim: int, state_dim: int, action_dim: int) -> ProposerState:
         raise NotImplementedError
 
-    def update(self, state: ProposerState, transitions: Any, key: jax.Array) -> Tuple[ProposerState, Metrics]:
-        """Called every training step with the training batch (for learned proposers)."""
+    def update(
+        self, state: ProposerState, ctx: UpdateContext, key: jax.Array
+    ) -> Tuple[ProposerState, Metrics]:
+        """Called every training step, after the agent's updates (for learned proposers)."""
         return state, {}
 
     def propose(
@@ -78,7 +104,7 @@ class EnvGoalProposer(GoalProposer):
     def total_candidates(self, num_envs: int) -> int:
         return 0
 
-    def init(self, key, goal_dim):
+    def init(self, key, goal_dim, state_dim, action_dim):
         return ()
 
     def propose(self, state, candidates, ctx, key):
