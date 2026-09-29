@@ -271,7 +271,12 @@ class MetricsRecorder:
             self.ensure_metric(metrics, key)
 
         if do_render:
-            render(make_policy, params, env, self.exp_dir, self.exp_name, num_steps)
+            try:
+                render(make_policy, params, env, self.exp_dir, self.exp_name, num_steps)
+            except OSError as e:
+                # renders are diagnostics: a transient filesystem error saving one (e.g. EIO
+                # on network scratch when wandb moves the html into WANDB_DIR) must not kill training
+                logging.warning("Skipping render at step %d: %s", num_steps, e)
 
         self.record(
             num_steps,
