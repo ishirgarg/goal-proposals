@@ -121,7 +121,7 @@ def main(config: Config):
             "ucritic/selected_u_std",
             "ucritic/candidate_u",
             "ucritic/agrees_with_mega",
-            "training/ucritic/td_loss",
+            f"training/ucritic/{config.goal_proposer.u_target}_loss",
             "training/ucritic/buffer_entropy",
             "training/ucritic/novelty_std",
             "training/ucritic/valid_frac",

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from jaxgcrl.goal_proposers import MEGAProposer, ProposalContext, UCriticProposer, UpdateContext, ValueCutoff
+from jaxgcrl.goal_proposers.ucritic import returns_to_episode_end
 
 STATE_DIM, GOAL_DIM, ACTION_DIM = 4, 2, 2
 
@@ -144,6 +145,46 @@ def test_update_ignores_transitions_across_episodes():
     proposer = UCriticProposer(**UPDATE_KWARGS)
     # every step is its own episode: no valid transition, so U must not move
     ctx = update_context(jnp.arange(4 * 16, dtype=jnp.float32).reshape(4, 16))
+    state = proposer.init(jax.random.PRNGKey(0), GOAL_DIM, STATE_DIM, ACTION_DIM)
+    new_state, metrics = jax.jit(proposer.update)(state, ctx, jax.random.PRNGKey(0))
+    assert float(metrics["ucritic/valid_frac"]) == 0.0
+    for old, new in zip(jax.tree_util.tree_leaves(state.params), jax.tree_util.tree_leaves(new_state.params)):
+        np.testing.assert_array_equal(old, new)
+
+
+def test_returns_to_episode_end():
+    # one window: episode 0 is states 0-2 (ends in the window), episode 1 is states 3-6 (does not)
+    traj_ids = jnp.array([[0, 0, 0, 1, 1, 1, 1]])
+    same = traj_ids[:, :-1] == traj_ids[:, 1:]
+    rewards = jnp.array([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+    returns, complete = returns_to_episode_end(rewards, same, 0.5)
+    # transition 1 ends the episode at state 2; transition 0 adds half of it
+    np.testing.assert_allclose(returns[0, :2], [1.0 + 0.5 * 2.0, 2.0])
+    # transitions 3-5 are summed within episode 1, but it has not ended by the window's end
+    np.testing.assert_allclose(returns[0, 3:], [4.0 + 0.5 * 5.0 + 0.25 * 6.0, 5.0 + 0.5 * 6.0, 6.0])
+    np.testing.assert_array_equal((same & complete)[0], [True, True, False, False, False, False])
+
+
+def test_mc_update_learns_novelty_reward():
+    # two episodes of 8 steps per window: the first ends inside the window, so its 7
+    # transitions get returns; the second is cut off by the window's end
+    proposer = UCriticProposer(**UPDATE_KWARGS, u_target="mc", u_discount=0.0, u_lr=1e-3, kde_bandwidth=0.5)
+    ctx = update_context(jnp.repeat(jnp.array([[0.0] * 8 + [1.0] * 8]), 4, axis=0))
+    state = proposer.init(jax.random.PRNGKey(0), GOAL_DIM, STATE_DIM, ACTION_DIM)
+    update = jax.jit(proposer.update)
+    losses = []
+    for i in range(30):
+        state, metrics = update(state, ctx, jax.random.PRNGKey(i))
+        losses.append(float(metrics["ucritic/mc_loss"]))
+    np.testing.assert_allclose(metrics["ucritic/valid_frac"], 7 / 15)
+    assert "ucritic/td_loss" not in metrics
+    assert losses[-1] < 0.25 * losses[0]
+
+
+def test_mc_update_ignores_episodes_that_do_not_end_in_the_window():
+    proposer = UCriticProposer(**UPDATE_KWARGS, u_target="mc")
+    # a single episode spans every window: no return is complete, so U must not move
+    ctx = update_context(jnp.zeros((4, 16)))
     state = proposer.init(jax.random.PRNGKey(0), GOAL_DIM, STATE_DIM, ACTION_DIM)
     new_state, metrics = jax.jit(proposer.update)(state, ctx, jax.random.PRNGKey(0))
     assert float(metrics["ucritic/valid_frac"]) == 0.0
